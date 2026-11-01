@@ -1,24 +1,35 @@
 --[[
-  Jurang Kelam — Delta script
-  Runtime : Roblox / Luau, executor Delta
+  Jurang Kelam — Delta script v2
+  Runtime : Roblox / Luau, executor Delta (mobile friendly)
   Target  : PlaceId 116463962153167 (GameId 10770728771), the hub
   Source  : Dumper++ v5.0 dump, 2026-11-02, place version 167
-  Run     : join the hub -> paste into Delta -> Execute.
+  Run     : join the hub -> Execute -> panel appears (draggable, "-" minimizes).
             Re-executing unloads the previous copy first.
   Status  : written from the decompiled client scripts, NOT tested in-game.
             Anything marked (inferred) depends on a name the dump did not show live.
 
-  How each feature works (all of it rides the game's own client paths):
-   Auto collect  Eggs/UGC drops are Parts with a "PickUp" RemoteEvent. The game's own
-                 code fires PickUp when the part's ProximityPrompt is shown (MaxActivationDistance 5).
-                 So we just stand on the part; if it is still unclaimed after 0.8s we fire PickUp
-                 ourselves, which is the exact call the game makes.
-   Auto gifts    Gift spawns create a ProximityPrompt "Insert Tokens" (range 28). Triggering it runs
-                 the game's insert animation, which then fires InsertToken. We trigger it while
-                 SpentTokens < EarnedTokens (Elite gifts: SpentEliteTokens / EarnedEliteTokens).
-   ESP           CollectionService tags: "%StateMob" (the Radar tool uses the same tag),
-                 "%Portal", "%UGCPedestal" and drop parts. Highlight + distance label.
-   Remote log    __namecall hook, prints FireServer / InvokeServer from the game's own scripts.
+  What "level 1-10" means here: the game has 10 element categories
+  (Connection, Light, Darkness, Fire, Earth, Water, Energy, Time, Ice, Air), 10 eggs each:
+  eggs 1-5 Common, 6-9 Primal, 10 Mythic. Progress = eggs owned (x/100), zones discovered (x/10),
+  NPC trades done (x/11).
+
+  AUTO JOURNEY runs these steps in a loop (content is unlocked by the event schedule, so it
+  re-checks every CFG.roundDelay seconds and does whatever is open):
+   1 sweep    Visits waypoints (TeleTargetAttachment tag + zone portals) so the map streams in, and
+              collects every egg/UGC drop it finds. Drops are Parts with a "PickUp" RemoteEvent; the
+              game fires PickUp itself when the 5-stud ProximityPrompt shows, we fire it as a fallback.
+   2 zones    EggIntoPortal parts (attr CategoryIndex + child CamLook). We stand on the portal and let the
+              game's own cutscene finish (it sets PlayedEggIntoPortal<N> and fires DiscoveredZoneReward).
+              If it never finishes we fire DiscoveredZoneReward(portal) ourselves.
+   3 trades   TradeNPC parts (attr TradeListIndex). Trade i (1-10): 5 spare Common eggs -> 1 Primal of
+              category i, trade 11: any Primal. Limit 1 each (player attr qf_NPCTrade<i>). The game only
+              lets you offer duplicates (amount-1 per egg) and lets you pick the reward, so we offer
+              spare commons and pick the Primal we own the fewest of.
+              Call: NPCTrade:FireServer(tradeId, {["cat"]={["idx"]=n}}, {cat, idx}) - same as the GUI.
+   4 gifts    Gift spawns show an "Insert Tokens" prompt; triggering it makes the game insert a token while
+              SpentTokens < EarnedTokens (Elite: SpentEliteTokens / EarnedEliteTokens).
+  Not automated on purpose: the Final Exit portal (it leaves the hub) and anything the server
+  gates by time (EventDay / Gate3) - those open when the schedule says so.
 ]]
 
 local env = (getgenv and getgenv()) or _G
@@ -30,11 +41,30 @@ local RunService = cloneref(game:GetService("RunService"))
 local UIS = cloneref(game:GetService("UserInputService"))
 local CollectionService = cloneref(game:GetService("CollectionService"))
 local Lighting = cloneref(game:GetService("Lighting"))
+local ReplicatedStorage = cloneref(game:GetService("ReplicatedStorage"))
+local HttpService = cloneref(game:GetService("HttpService"))
+local VirtualUser = cloneref(game:GetService("VirtualUser"))
 local lp = Players.LocalPlayer
 
 if game.PlaceId ~= 116463962153167 then
   warn("[JK] PlaceId " .. game.PlaceId .. " is not the dumped hub (116463962153167); some features will find nothing.")
 end
+
+-- ───────────────────────── config ─────────────────────────
+local CFG = {
+  speed = 32,
+  roundDelay = 30,        -- seconds between journey rounds
+  cutsceneTimeout = 25,   -- how long to let the game's own portal cutscene run before firing the reward remote
+  waypointGap = 60,       -- merge sweep waypoints closer than this (studs)
+  skipPaths = { "FinaleZone" }, -- sweep never goes under these paths (finale stays manual)
+}
+
+local ELEMENT = { "Connection", "Light", "Darkness", "Fire", "Earth", "Water", "Energy", "Time", "Ice", "Air" }
+
+-- NPCTrades from the dump: 1-10 = 5 common -> primal of that category, 11 = any primal
+local TRADES = {}
+for i = 1, 10 do TRADES[i] = { offer = 5, reward = i, limit = 1 } end
+TRADES[11] = { offer = 5, reward = -1, limit = 1 }
 
 -- ───────────────────────── state ─────────────────────────
 local alive = true
@@ -42,14 +72,33 @@ local conns = {}
 local function track(c) conns[#conns + 1] = c; return c end
 
 local S = {
-  collect = false, gifts = false,
+  journey = false, collect = false, gifts = false,
   espMobs = false, espDrops = false, espPortals = false,
   bright = false, speed = false, noclip = false, infjump = false, spy = false,
+  antiafk = true,
 }
-local SPEED = 32
-local status -- TextLabel, set by the UI below
+
+-- cancel token: bumping gen aborts whatever pass is running
+local gen = 0
+local function stale(g) return (not alive) or g ~= gen end
+
+local status, prog -- TextLabels, set by the UI below
 local function notify(msg)
   if status then status.Text = msg end
+end
+
+-- only one automation pass touches the character at a time
+local busy = false
+local function locked(fn)
+  if busy then return false end
+  busy = true
+  local ok, err = pcall(fn)
+  busy = false
+  if not ok then
+    warn("[JK] " .. tostring(err))
+    notify("error: " .. tostring(err))
+  end
+  return true
 end
 
 -- ───────────────────────── helpers ─────────────────────────
@@ -76,10 +125,107 @@ local function anchorOf(i)
   return nil
 end
 
+local function tpTo(pos)
+  local r = root()
+  if not r then return false end
+  r.CFrame = CFrame.new(pos)
+  r.AssemblyLinearVelocity = Vector3.new(0, 0, 0)
+  return true
+end
+
 local function pickRemote(part)
   local r = part:FindFirstChild("PickUp")
   if r and string.find(r.ClassName, "RemoteEvent") then return r end
   return nil
+end
+
+-- Remotes live somewhere under ReplicatedStorage (RemoteUtils looks them up by name)
+local remoteCache = {}
+local function remote(name)
+  local r = remoteCache[name]
+  if r and r.Parent then return r end
+  local folder = ReplicatedStorage:FindFirstChild("Remotes")
+  r = (folder and folder:FindFirstChild(name, true)) or ReplicatedStorage:FindFirstChild(name, true)
+  if r then remoteCache[name] = r end
+  return r
+end
+
+local function firePrompt(pp)
+  pp.Enabled = true
+  if fireproximityprompt then
+    fireproximityprompt(pp)
+  elseif getconnections then
+    for _, c in ipairs(getconnections(pp.Triggered)) do pcall(function() c:Fire() end) end
+  end
+end
+
+local function dist(a, b) return (a - b).Magnitude end
+
+-- greedy nearest-neighbour ordering so we do not zig-zag across the map
+local function nearestOrder(items, from, posf)
+  local out, cur = {}, from
+  local pool = {}
+  for i, v in ipairs(items) do pool[i] = v end
+  while #pool > 0 do
+    local bi, bd = 1, math.huge
+    for i, v in ipairs(pool) do
+      local d = dist(posf(v), cur)
+      if d < bd then bi, bd = i, d end
+    end
+    local v = table.remove(pool, bi)
+    out[#out + 1] = v
+    cur = posf(v)
+  end
+  return out
+end
+
+-- ───────────────────────── game data ─────────────────────────
+-- Player attribute "Inventory" is JSON: [category][eggIndex] = amount
+local function readInventory()
+  local inv = {}
+  local raw = lp:GetAttribute("Inventory")
+  if type(raw) ~= "string" then return inv end
+  local ok, data = pcall(function() return HttpService:JSONDecode(raw) end)
+  if not ok or type(data) ~= "table" then return inv end
+  for c, row in pairs(data) do
+    local cn = tonumber(c)
+    if cn and type(row) == "table" then
+      inv[cn] = {}
+      for i, n in pairs(row) do
+        local idx = tonumber(i)
+        if idx then inv[cn][idx] = tonumber(n) or 0 end
+      end
+    end
+  end
+  return inv
+end
+
+local function zoneDone(cat)
+  if lp:GetAttribute("PlayedEggIntoPortal" .. cat) then return true end
+  local b = lp:FindFirstChild("Badges")
+  if b and b:GetAttribute("Category" .. cat .. "Discovered") then return true end
+  return false
+end
+
+local function progressText()
+  local inv = readInventory()
+  local own, spare = 0, 0
+  for c = 1, 10 do
+    for i = 1, 10 do
+      local n = (inv[c] and inv[c][i]) or 0
+      if n > 0 then own = own + 1 end
+      if i <= 5 and n > 1 then spare = spare + (n - 1) end
+    end
+  end
+  local zones, trades = 0, 0
+  for c = 1, 10 do
+    if zoneDone(c) then zones = zones + 1 end
+  end
+  for t = 1, 11 do
+    if (lp:GetAttribute("qf_NPCTrade" .. t) or 0) >= 1 then trades = trades + 1 end
+  end
+  return ("eggs %d/100 | spare commons %d\nzones %d/10 | trades %d/11 | day %s"):format(
+    own, spare, zones, trades, tostring(workspace:GetAttribute("EventDay") or "?"))
 end
 
 -- Egg drops carry attribute EggDrop; UGC drops carry ItemId + BadgeName. Both have a PickUp remote
@@ -104,43 +250,26 @@ local function findDrops()
   return out
 end
 
--- ───────────────────────── auto collect ─────────────────────────
-local function grab(p)
-  local r = root()
-  if not r then return end
-  r.CFrame = CFrame.new(p.Position + Vector3.new(0, 2, 0)) -- inside the 5-stud prompt range
-  local t0 = os.clock()
-  while alive and p.Parent and not p:GetAttribute("Claimed") and os.clock() - t0 < 0.8 do
-    task.wait(0.05)
+-- EggIntoPortal parts: CategoryIndex attribute + CamLook child, no PickUp (that would be an egg drop)
+local function findPortals()
+  local out = {}
+  for _, d in ipairs(workspace:GetDescendants()) do
+    if d:IsA("BasePart") and d:GetAttribute("CategoryIndex") ~= nil
+      and d:FindFirstChild("CamLook") and not pickRemote(d) then
+      out[#out + 1] = d
+    end
   end
-  if alive and p.Parent and not p:GetAttribute("Claimed") then
-    local rem = pickRemote(p)
-    if rem then rem:FireServer() end -- same call as the game's PromptShown handler
-    task.wait(0.25)
-  end
+  return out
 end
 
-task.spawn(function()
-  while alive do
-    if S.collect and root() then
-      local list = findDrops()
-      if #list > 0 then
-        local home = root().CFrame
-        notify("collecting " .. #list .. " drop(s)")
-        for _, p in ipairs(list) do
-          if not (alive and S.collect) then break end
-          grab(p)
-        end
-        local r = root()
-        if r then r.CFrame = home end
-        notify("collect pass done")
-      end
-    end
-    task.wait(2)
+local function findTradeNPCs()
+  local out = {}
+  for _, d in ipairs(workspace:GetDescendants()) do
+    if d:IsA("BasePart") and d:GetAttribute("TradeListIndex") ~= nil then out[#out + 1] = d end
   end
-end)
+  return out
+end
 
--- ───────────────────────── auto gifts ─────────────────────────
 local function findGifts()
   local out = {}
   for _, d in ipairs(workspace:GetDescendants()) do
@@ -152,6 +281,188 @@ local function findGifts()
   return out
 end
 
+-- ───────────────────────── step: collect ─────────────────────────
+local function grab(p, g)
+  if not tpTo(p.Position + Vector3.new(0, 2, 0)) then return end -- inside the 5-stud prompt range
+  local t0 = os.clock()
+  while not stale(g) and p.Parent and not p:GetAttribute("Claimed") and os.clock() - t0 < 0.8 do
+    task.wait(0.05)
+  end
+  if not stale(g) and p.Parent and not p:GetAttribute("Claimed") then
+    local rem = pickRemote(p)
+    if rem then rem:FireServer() end -- same call as the game's PromptShown handler
+    task.wait(0.25)
+  end
+end
+
+-- one pass over every drop currently streamed in; returns how many it visited
+local function collectNow(g)
+  local r = root()
+  if not r then return 0 end
+  local list = findDrops()
+  if #list == 0 then return 0 end
+  local home = r.CFrame
+  local n = 0
+  for _, p in ipairs(nearestOrder(list, r.Position, function(x) return x.Position end)) do
+    if stale(g) then break end
+    grab(p, g)
+    n = n + 1
+  end
+  local rr = root()
+  if rr then rr.CFrame = home end
+  return n
+end
+
+-- ───────────────────────── step: sweep ─────────────────────────
+local function skipped(inst)
+  local name = inst:GetFullName()
+  for _, bad in ipairs(CFG.skipPaths) do
+    if string.find(name, bad, 1, true) then return true end
+  end
+  return false
+end
+
+local function waypoints()
+  local pts = {}
+  local function add(inst)
+    local p = posOf(inst)
+    if p and not skipped(inst) then pts[#pts + 1] = p end
+  end
+  for _, i in ipairs(CollectionService:GetTagged("TeleTargetAttachment")) do add(i) end
+  for _, part in ipairs(findPortals()) do add(part) end
+  return pts
+end
+
+local function dedupe(pts, gap)
+  local out = {}
+  for _, p in ipairs(pts) do
+    local keep = true
+    for _, q in ipairs(out) do
+      if dist(p, q) < gap then
+        keep = false
+        break
+      end
+    end
+    if keep then out[#out + 1] = p end
+  end
+  return out
+end
+
+local function sweep(g)
+  local r = root()
+  if not r then return end
+  local home = r.CFrame
+  local total = collectNow(g)
+  local pts = nearestOrder(dedupe(waypoints(), CFG.waypointGap), r.Position, function(p) return p end)
+  for i, p in ipairs(pts) do
+    if stale(g) then break end
+    if not tpTo(p + Vector3.new(0, 5, 0)) then break end
+    notify(("sweep %d/%d (%d drops so far)"):format(i, #pts, total))
+    pcall(function() lp:RequestStreamAroundAsync(p, 1.5) end) -- no-op when streaming is off
+    task.wait(0.4)
+    total = total + collectNow(g)
+  end
+  local rr = root()
+  if rr then rr.CFrame = home end
+end
+
+-- ───────────────────────── step: discover zones ─────────────────────────
+local zoneCool = {}
+
+local function discoverAll(g)
+  for _, part in ipairs(findPortals()) do
+    if stale(g) then return end
+    local cat = part:GetAttribute("CategoryIndex")
+    if cat and not zoneDone(cat) and (zoneCool[part] or 0) < os.clock() then
+      notify(("zone %d (%s): entering"):format(cat, ELEMENT[cat] or "?"))
+      tpTo(part.Position + Vector3.new(0, part.Size.Y / 2 + 4, 0))
+      local t0 = os.clock()
+      while not stale(g) and not zoneDone(cat) and os.clock() - t0 < CFG.cutsceneTimeout do
+        task.wait(0.5)
+      end
+      if not stale(g) and not zoneDone(cat) then
+        local rem = remote("DiscoveredZoneReward")
+        if rem then rem:FireServer(part) end -- same call the cutscene ends with
+        zoneCool[part] = os.clock() + 120
+        task.wait(1.5)
+      end
+    end
+  end
+end
+
+-- ───────────────────────── step: NPC trades ─────────────────────────
+local tradeCool = {}
+
+-- spare commons only: the GUI offers amount-1 per egg and rarity 1 = eggs 1-5
+local function buildOffer(inv, need)
+  local offer, got = {}, 0
+  for cat = 1, 10 do
+    for idx = 1, 5 do
+      local spare = ((inv[cat] and inv[cat][idx]) or 0) - 1
+      if spare > 0 and got < need then
+        local take = math.min(spare, need - got)
+        local ck = tostring(cat)
+        offer[ck] = offer[ck] or {}
+        offer[ck][tostring(idx)] = take
+        got = got + take
+      end
+    end
+  end
+  if got == need then return offer end
+  return nil
+end
+
+-- primal eggs are indices 6-9; pick the one we own the fewest of
+local function pickReward(inv, reward)
+  local lo, hi = reward, reward
+  if reward == -1 then lo, hi = 1, 10 end
+  local best, bestN
+  for cat = lo, hi do
+    for idx = 6, 9 do
+      local n = (inv[cat] and inv[cat][idx]) or 0
+      if best == nil or n < bestN then
+        best, bestN = { cat, idx }, n
+      end
+    end
+  end
+  return best
+end
+
+local function tradeAll(g)
+  local ev = remote("NPCTrade")
+  if not ev then
+    notify("NPCTrade remote not found")
+    return 0
+  end
+  local did = 0
+  for _, npc in ipairs(findTradeNPCs()) do
+    if stale(g) then break end
+    local id = npc:GetAttribute("TradeListIndex")
+    local trade = TRADES[id]
+    local key = "qf_NPCTrade" .. tostring(id)
+    local before = lp:GetAttribute(key) or 0
+    if trade and before < trade.limit and (tradeCool[npc] or 0) < os.clock() then
+      local inv = readInventory()
+      local offer = buildOffer(inv, trade.offer)
+      local pick = pickReward(inv, trade.reward)
+      if offer and pick then
+        notify(("trade %d: egg %d-%d"):format(id, pick[1], pick[2]))
+        tpTo(npc.Position + Vector3.new(0, 3, 5)) -- NPC ring is 10 studs
+        task.wait(0.6)
+        ev:FireServer(id, offer, { pick[1], pick[2] }) -- (tradeId, offer, chosen reward) like the GUI
+        local t0 = os.clock()
+        while not stale(g) and (lp:GetAttribute(key) or 0) == before and os.clock() - t0 < 4 do
+          task.wait(0.2)
+        end
+        if (lp:GetAttribute(key) or 0) == before then tradeCool[npc] = os.clock() + 60 end
+        did = did + 1
+      end
+    end
+  end
+  return did
+end
+
+-- ───────────────────────── step: gifts ─────────────────────────
 local function isElite(part)
   local s = string.lower(part.Name)
   for _, t in ipairs(CollectionService:GetTags(part)) do s = s .. " " .. string.lower(t) end
@@ -163,19 +474,10 @@ local function isElite(part)
   return string.find(s, "elite") ~= nil
 end
 
-local function firePrompt(pp)
-  pp.Enabled = true
-  if fireproximityprompt then
-    fireproximityprompt(pp)
-  elseif getconnections then
-    for _, c in ipairs(getconnections(pp.Triggered)) do pcall(function() c:Fire() end) end
-  end
-end
-
 local giftCooldown, giftHome = {}, nil
 
--- returns true if it acted (so the loop re-evaluates after every token)
-local function giftPass()
+-- returns true if it acted (so callers re-evaluate after every token)
+local function giftPass(g)
   for _, part in ipairs(findGifts()) do
     local elite = isElite(part)
     local spentK = elite and "SpentEliteTokens" or "SpentTokens"
@@ -185,12 +487,12 @@ local function giftPass()
       local r = root()
       if not r then return false end
       if not giftHome then giftHome = r.CFrame end
-      r.CFrame = CFrame.new(part.Position + Vector3.new(0, 3, 10)) -- prompt range is 28
+      tpTo(part.Position + Vector3.new(0, 3, 10)) -- prompt range is 28
       task.wait(0.4)
       firePrompt(part:FindFirstChildOfClass("ProximityPrompt"))
       notify(("inserting token (%d/%d)"):format(spent, earned))
       local t0 = os.clock()
-      while alive and S.gifts and lp:GetAttribute(spentK) == spent and os.clock() - t0 < 10 do
+      while not stale(g) and lp:GetAttribute(spentK) == spent and os.clock() - t0 < 10 do
         task.wait(0.2)
       end
       if lp:GetAttribute(spentK) == spent then giftCooldown[part] = os.clock() + 60 end
@@ -200,20 +502,104 @@ local function giftPass()
   return false
 end
 
+local function giftAll(g)
+  for _ = 1, 40 do
+    if stale(g) or not giftPass(g) then break end
+  end
+end
+
+local function giftReturn()
+  if giftHome then
+    local r = root()
+    if r then r.CFrame = giftHome end
+    giftHome = nil
+  end
+end
+
+-- ───────────────────────── journey ─────────────────────────
+local function journeyRound(g)
+  local r = root()
+  if not r then return end
+  local home = r.CFrame
+  notify("1/4 sweep + collect")
+  sweep(g)
+  if stale(g) then return end
+  notify("2/4 discover zones")
+  discoverAll(g)
+  if stale(g) then return end
+  notify("3/4 NPC trades")
+  tradeAll(g)
+  if stale(g) then return end
+  notify("4/4 gift tokens")
+  giftAll(g)
+  giftReturn()
+  local rr = root()
+  if rr then rr.CFrame = home end
+  notify("round done, next in " .. CFG.roundDelay .. "s")
+end
+
 task.spawn(function()
   while alive do
-    if S.gifts and root() then
-      local acted = giftPass()
-      if not acted and giftHome then
-        local r = root()
-        if r then r.CFrame = giftHome end
-        giftHome = nil
-        notify("no tokens left to insert")
+    if S.journey then
+      local g = gen
+      locked(function() journeyRound(g) end)
+      for _ = 1, CFG.roundDelay do
+        if stale(g) or not S.journey then break end
+        task.wait(1)
       end
+    else
+      task.wait(1)
+    end
+  end
+end)
+
+-- standalone loops (only when the journey is off)
+task.spawn(function()
+  while alive do
+    if S.collect and not S.journey and root() then
+      local g = gen
+      locked(function()
+        local n = collectNow(g)
+        if n > 0 then notify("collected " .. n .. " drop(s)") end
+      end)
+    end
+    task.wait(2)
+  end
+end)
+
+task.spawn(function()
+  while alive do
+    if S.gifts and not S.journey and root() then
+      local g = gen
+      locked(function()
+        if not giftAll(g) and not giftHome then return end
+        giftReturn()
+      end)
     end
     task.wait(1)
   end
 end)
+
+-- progress readout
+task.spawn(function()
+  while alive do
+    if prog then
+      local ok, txt = pcall(progressText)
+      if ok then prog.Text = txt end
+    end
+    task.wait(2)
+  end
+end)
+
+-- anti idle-kick (20 min) for long unattended runs
+track(lp.Idled:Connect(function()
+  if S.antiafk then
+    pcall(function()
+      VirtualUser:CaptureController()
+      VirtualUser:ClickButton2(Vector2.new())
+    end)
+  end
+end))
 
 -- ───────────────────────── ESP ─────────────────────────
 local espFolder
@@ -285,7 +671,7 @@ task.spawn(function()
         dropMark(inst)
       elseif r then
         local p = posOf(inst)
-        if p then m.tl.Text = ("%s [%d]"):format(inst.Name, (p - r.Position).Magnitude) end
+        if p then m.tl.Text = ("%s [%d]"):format(inst.Name, dist(p, r.Position)) end
       end
     end
     task.wait(0.5)
@@ -336,7 +722,7 @@ local noclipSaved = {}
 track(RunService.Heartbeat:Connect(function()
   if S.speed then
     local h = humanoid()
-    if h then h.WalkSpeed = SPEED end
+    if h then h.WalkSpeed = CFG.speed end
   end
 end))
 
@@ -373,8 +759,8 @@ local function tpNext(kind)
   if #pts == 0 then notify("no " .. kind .. " found (not streamed in?)"); return end
   tpIndex[kind] = tpIndex[kind] % #pts + 1
   local target = pts[tpIndex[kind]]
-  local p, r = posOf(target), root()
-  if p and r then r.CFrame = CFrame.new(p + Vector3.new(0, 4, 0)) end
+  local p = posOf(target)
+  if p then tpTo(p + Vector3.new(0, 4, 0)) end
   notify(("%s %d/%d: %s"):format(kind, tpIndex[kind], #pts, target.Name))
 end
 
@@ -415,11 +801,12 @@ espFolder.Name = "esp"
 espFolder.Parent = gui
 
 local BG, ON, OFF = Color3.fromRGB(24, 24, 30), Color3.fromRGB(70, 160, 90), Color3.fromRGB(48, 48, 58)
+local HI = Color3.fromRGB(120, 80, 200)
 
 local frame = Instance.new("Frame")
-frame.Size = UDim2.fromOffset(210, 0)
+frame.Size = UDim2.fromOffset(230, 0)
 frame.AutomaticSize = Enum.AutomaticSize.Y
-frame.Position = UDim2.fromOffset(12, 70)
+frame.Position = UDim2.fromOffset(12, 60)
 frame.BackgroundColor3 = BG
 frame.BorderSizePixel = 0
 frame.Active = true
@@ -428,23 +815,92 @@ frame.Parent = gui
 Instance.new("UICorner", frame).CornerRadius = UDim.new(0, 8)
 local pad = Instance.new("UIPadding", frame)
 pad.PaddingTop, pad.PaddingBottom, pad.PaddingLeft, pad.PaddingRight = UDim.new(0, 6), UDim.new(0, 6), UDim.new(0, 6), UDim.new(0, 6)
-local layout = Instance.new("UIListLayout", frame)
-layout.Padding = UDim.new(0, 4)
-layout.SortOrder = Enum.SortOrder.LayoutOrder
+local flayout = Instance.new("UIListLayout", frame)
+flayout.Padding = UDim.new(0, 4)
+flayout.SortOrder = Enum.SortOrder.LayoutOrder
+
+-- header: plain label + minimize button (label is not a button so the panel drags from it on touch)
+local header = Instance.new("Frame")
+header.Size = UDim2.new(1, 0, 0, 24)
+header.BackgroundTransparency = 1
+header.LayoutOrder = 0
+header.Parent = frame
+local title = Instance.new("TextLabel")
+title.Size = UDim2.new(1, -30, 1, 0)
+title.BackgroundTransparency = 1
+title.TextColor3 = Color3.new(1, 1, 1)
+title.Font = Enum.Font.GothamBold
+title.TextSize = 14
+title.Text = "Jurang Kelam v2"
+title.Parent = header
+local mini = Instance.new("TextButton")
+mini.Size = UDim2.fromOffset(26, 22)
+mini.Position = UDim2.new(1, -26, 0, 1)
+mini.BackgroundColor3 = OFF
+mini.TextColor3 = Color3.new(1, 1, 1)
+mini.Font = Enum.Font.GothamBold
+mini.TextSize = 14
+mini.Text = "-"
+mini.BorderSizePixel = 0
+mini.Parent = header
+Instance.new("UICorner", mini).CornerRadius = UDim.new(0, 6)
+
+local scroller = Instance.new("ScrollingFrame")
+scroller.Size = UDim2.new(1, 0, 0, 250)
+scroller.BackgroundTransparency = 1
+scroller.BorderSizePixel = 0
+scroller.ScrollBarThickness = 4
+scroller.AutomaticCanvasSize = Enum.AutomaticSize.Y
+scroller.CanvasSize = UDim2.new()
+scroller.LayoutOrder = 1
+scroller.Parent = frame
+local slayout = Instance.new("UIListLayout", scroller)
+slayout.Padding = UDim.new(0, 4)
+slayout.SortOrder = Enum.SortOrder.LayoutOrder
+
+prog = Instance.new("TextLabel")
+prog.Size = UDim2.new(1, 0, 0, 30)
+prog.BackgroundTransparency = 1
+prog.TextColor3 = Color3.fromRGB(150, 220, 160)
+prog.Font = Enum.Font.GothamMedium
+prog.TextSize = 11
+prog.TextWrapped = true
+prog.Text = "..."
+prog.LayoutOrder = 2
+prog.Parent = frame
+
+status = Instance.new("TextLabel")
+status.Size = UDim2.new(1, 0, 0, 30)
+status.BackgroundTransparency = 1
+status.TextColor3 = Color3.fromRGB(170, 170, 185)
+status.Font = Enum.Font.Gotham
+status.TextSize = 11
+status.TextWrapped = true
+status.Text = "ready"
+status.LayoutOrder = 3
+status.Parent = frame
+
+mini.Activated:Connect(function()
+  local open = not scroller.Visible
+  scroller.Visible = open
+  prog.Visible = open
+  status.Visible = open
+  mini.Text = open and "-" or "+"
+end)
 
 local order = 0
-local function mk(text, h)
+local function mk(text, color)
   order = order + 1
   local b = Instance.new("TextButton")
-  b.Size = UDim2.new(1, 0, 0, h or 28)
-  b.BackgroundColor3 = OFF
+  b.Size = UDim2.new(1, -6, 0, 28)
+  b.BackgroundColor3 = color or OFF
   b.TextColor3 = Color3.new(1, 1, 1)
   b.Font = Enum.Font.GothamMedium
   b.TextSize = 13
   b.Text = text
   b.BorderSizePixel = 0
   b.LayoutOrder = order
-  b.Parent = frame
+  b.Parent = scroller
   Instance.new("UICorner", b).CornerRadius = UDim.new(0, 6)
   return b
 end
@@ -455,6 +911,7 @@ local function toggle(label, key, onChange)
   b.Activated:Connect(function()
     S[key] = not S[key]
     paint()
+    if not S[key] then gen = gen + 1 end -- turning anything off cancels the running pass
     if onChange then onChange(S[key]) end
   end)
   paint()
@@ -464,30 +921,39 @@ local function button(label, fn)
   mk(label).Activated:Connect(fn)
 end
 
--- plain label (not a button) so the panel can be dragged from the title on touch screens too
-local title = Instance.new("TextLabel")
-title.Size = UDim2.new(1, 0, 0, 24)
-title.BackgroundTransparency = 1
-title.TextColor3 = Color3.new(1, 1, 1)
-title.Font = Enum.Font.GothamBold
-title.TextSize = 14
-title.Text = "Jurang Kelam"
-title.LayoutOrder = 0
-title.Parent = frame
+-- run one automation step on demand
+local function oneShot(name, fn)
+  button(name, function()
+    gen = gen + 1
+    local g = gen
+    task.spawn(function()
+      if not locked(function() fn(g) end) then
+        notify("busy, stop the running pass first")
+      end
+    end)
+  end)
+end
 
+toggle("AUTO JOURNEY (cat 1-10)", "journey", function(on)
+  if on then notify("journey started") end
+end)
+button("STOP (cancel running pass)", function()
+  gen = gen + 1
+  notify("cancelled")
+end)
+oneShot("Sweep map + collect now", sweep)
+oneShot("Discover zones now", discoverAll)
+oneShot("Trade with NPCs now", tradeAll)
 toggle("Auto collect eggs / UGC drops", "collect")
 toggle("Auto insert gift tokens", "gifts", function(on)
-  if not on and giftHome then
-    local r = root()
-    if r then r.CFrame = giftHome end
-    giftHome = nil
-  end
+  if not on then giftReturn() end
 end)
+toggle("Anti idle-kick", "antiafk")
 toggle("ESP: mobs", "espMobs")
 toggle("ESP: drops", "espDrops")
 toggle("ESP: portals / pedestals", "espPortals")
 toggle("Fullbright / no fog", "bright", function(on) if not on then brightOff() end end)
-toggle("Speed x2 (" .. SPEED .. ")", "speed", function(on)
+toggle("Speed (" .. CFG.speed .. ")", "speed", function(on)
   local h = humanoid()
   if on then
     origSpeed = h and h.WalkSpeed or 16
@@ -515,20 +981,10 @@ end)
 button("TP next portal", function() tpNext("portals") end)
 button("TP next TeleTarget", function() tpNext("points") end)
 
-status = Instance.new("TextLabel")
-status.Size = UDim2.new(1, 0, 0, 30)
-status.BackgroundTransparency = 1
-status.TextColor3 = Color3.fromRGB(170, 170, 185)
-status.Font = Enum.Font.Gotham
-status.TextSize = 11
-status.TextWrapped = true
-status.Text = "ready"
-status.LayoutOrder = 999
-status.Parent = frame
-
 -- ───────────────────────── unload ─────────────────────────
 local function unload()
   alive = false
+  gen = gen + 1
   for k in pairs(S) do S[k] = false end
   env.__JK_SPY = false
   for _, c in ipairs(conns) do pcall(function() c:Disconnect() end) end
